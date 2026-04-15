@@ -1,0 +1,151 @@
+// ======================================================
+// Two TFmini-S sensors on Arduino Mega
+// TFmini #1 TX -> Mega RX1 (pin 19)
+// TFmini #2 TX -> Mega RX2 (pin 17)
+// Power both sensors from 5V, common GND
+// ======================================================
+
+struct TFminiData {
+  uint16_t distance_cm = 0;
+  uint16_t strength = 0;
+  bool valid = false;
+};
+
+TFminiData leftSensor;
+TFminiData rightSensor;
+
+// ---------- Helper: read one valid TFmini frame ----------
+bool readTFminiFrame(HardwareSerial &port, TFminiData &data) {
+  const int FRAME_SIZE = 9;
+
+  while (port.available() >= FRAME_SIZE) {
+    // Look for frame header 0x59 0x59
+    if (port.read() == 0x59) {
+      if (port.peek() == 0x59) {
+        uint8_t frame[FRAME_SIZE];
+        frame[0] = 0x59;
+        frame[1] = port.read();
+
+        for (int i = 2; i < FRAME_SIZE; i++) {
+          unsigned long start = millis();
+          while (!port.available()) {
+            if (millis() - start > 10) {
+              return false;
+            }
+          }
+          frame[i] = port.read();
+        }
+
+        // Checksum
+        uint16_t checksum = 0;
+        for (int i = 0; i < 8; i++) {
+          checksum += frame[i];
+        }
+
+        if ((checksum & 0xFF) == frame[8]) {
+          data.distance_cm = frame[2] | (frame[3] << 8);
+          data.strength = frame[4] | (frame[5] << 8);
+          data.valid = true;
+          return true;
+        }
+      }
+    }
+  }
+
+  return false;
+}
+
+// ---------- Unit conversion helpers ----------
+float cmToInches(uint16_t cm) {
+  return cm / 2.54;
+}
+
+float cmToFeet(uint16_t cm) {
+  return cm / 30.48;
+}
+
+// ---------- Optional: ignore nonsense values ----------
+bool usableReading(const TFminiData &d) {
+  // You can tune this if needed
+  // Ignore zero and very weak/noisy returns if desired
+  return d.valid && d.distance_cm > 0;
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial1.begin(115200);   // TFmini #1 on RX1 pin 19
+  Serial2.begin(115200);   // TFmini #2 on RX2 pin 17
+
+  delay(500);
+  Serial.println("Two TFmini-S obstacle comparison starting...");
+}
+
+void loop() {
+  // Keep updating latest valid reading from each sensor
+  readTFminiFrame(Serial1, leftSensor);
+  readTFminiFrame(Serial2, rightSensor);
+
+  static unsigned long lastPrint = 0;
+  if (millis() - lastPrint >= 200) {
+    lastPrint = millis();
+
+    bool leftOK = usableReading(leftSensor);
+    bool rightOK = usableReading(rightSensor);
+
+    Serial.println("--------------------------------------------------");
+
+    // Print LEFT sensor
+    Serial.print("LEFT  : ");
+    if (leftOK) {
+      Serial.print(leftSensor.distance_cm);
+      Serial.print(" cm | ");
+      Serial.print(cmToInches(leftSensor.distance_cm), 1);
+      Serial.print(" in | ");
+      Serial.print(cmToFeet(leftSensor.distance_cm), 2);
+      Serial.print(" ft | strength = ");
+      Serial.println(leftSensor.strength);
+    } else {
+      Serial.println("No valid reading");
+    }
+
+    // Print RIGHT sensor
+    Serial.print("RIGHT : ");
+    if (rightOK) {
+      Serial.print(rightSensor.distance_cm);
+      Serial.print(" cm | ");
+      Serial.print(cmToInches(rightSensor.distance_cm), 1);
+      Serial.print(" in | ");
+      Serial.print(cmToFeet(rightSensor.distance_cm), 2);
+      Serial.print(" ft | strength = ");
+      Serial.println(rightSensor.strength);
+    } else {
+      Serial.println("No valid reading");
+    }
+
+    // Compare which is closer
+    if (leftOK && rightOK) {
+      if (leftSensor.distance_cm < rightSensor.distance_cm) {
+        Serial.print("Closer obstacle: LEFT by ");
+        Serial.print(rightSensor.distance_cm - leftSensor.distance_cm);
+        Serial.println(" cm");
+      } 
+      else if (rightSensor.distance_cm < leftSensor.distance_cm) {
+        Serial.print("Closer obstacle: RIGHT by ");
+        Serial.print(leftSensor.distance_cm - rightSensor.distance_cm);
+        Serial.println(" cm");
+      } 
+      else {
+        Serial.println("Closer obstacle: SAME DISTANCE");
+      }
+    } 
+    else if (leftOK && !rightOK) {
+      Serial.println("Closer obstacle: LEFT (right sensor invalid)");
+    } 
+    else if (!leftOK && rightOK) {
+      Serial.println("Closer obstacle: RIGHT (left sensor invalid)");
+    } 
+    else {
+      Serial.println("Closer obstacle: UNKNOWN (both invalid)");
+    }
+  }
+}
