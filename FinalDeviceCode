@@ -1,0 +1,133 @@
+#include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BNO055.h>
+
+// --- Configuration ---
+const int MOTOR_LEFT = 2;
+const int MOTOR_RIGHT = 3;
+
+// Structure to track sensor state for velocity calculations
+struct SensorData {
+  int currentDistCm = 0;
+  int lastDistCm = 0;
+  float velocityFps = 0.0;
+  unsigned long lastTimestamp = 0;
+  bool objectInView = false; // Tracks if an object was seen in the last frame
+};
+
+SensorData leftSensor, rightSensor;
+Adafruit_BNO055 bno = Adafruit_BNO055(55);
+
+// Latency Variables
+unsigned long totalLatency = 0;
+int latencyCount = 0;
+
+void setup() {
+  Serial.begin(115200); 
+  Serial1.begin(115200); // TFmini Left
+  Serial2.begin(115200); // TFmini Right
+
+  pinMode(MOTOR_LEFT, OUTPUT);
+  pinMode(MOTOR_RIGHT, OUTPUT);
+
+  if (!bno.begin()) {
+    Serial.println("IMU Error: BNO055 not detected!");
+    while (1);
+  }
+  bno.setExtCrystalUse(true);
+
+  Serial.println("--- SAVI Dynamic Velocity Test ---");
+}
+
+void loop() {
+  unsigned long loopStart = micros();
+
+  // 1. Capture Current Distances
+  readTFmini(Serial1, leftSensor.currentDistCm);
+  readTFmini(Serial2, rightSensor.currentDistCm);
+  
+  // 2. Calculate Approach Velocities
+  calculateVelocity(leftSensor);
+  calculateVelocity(rightSensor);
+
+  sensors_event_t event;
+  bno.getEvent(&event);
+
+  // 3. Haptic Logic (Now Velocity-Driven)
+  updateMotorVelocity(MOTOR_LEFT, leftSensor);
+  updateMotorVelocity(MOTOR_RIGHT, rightSensor);
+
+  // 4. Latency Tracking
+  unsigned long loopEnd = micros();
+  totalLatency += (loopEnd - loopStart);
+  latencyCount++;
+
+  // 5. Data Printout (Every 500ms)
+  static unsigned long lastPrint = 0;
+  if (millis() - lastPrint > 500) {
+    float avgLat = (float)totalLatency / latencyCount;
+    Serial.print("L_Vel: "); Serial.print(leftSensor.velocityFps, 2); Serial.print(" fps | ");
+    Serial.print("R_Vel: "); Serial.print(rightSensor.velocityFps, 2); Serial.print(" fps | ");
+    Serial.print("Avg Latency: "); Serial.print(avgLat, 1); Serial.println(" us");
+    
+    totalLatency = 0;
+    latencyCount = 0;
+    lastPrint = millis();
+  }
+}
+
+// --- Helper Functions ---
+
+void calculateVelocity(SensorData &s) {
+  unsigned long now = millis();
+  float deltaTime = (now - s.lastTimestamp) / 1000.0; // Seconds
+
+  if (deltaTime >= 0.05) { // Only update velocity every 50ms for stability
+    // Change in feet / change in time
+    // Positive = Getting Closer, Negative = Moving Away
+    float distChangeFt = (s.lastDistCm - s.currentDistCm) / 30.48;
+    s.velocityFps = distChangeFt / deltaTime;
+
+    s.lastDistCm = s.currentDistCm;
+    s.lastTimestamp = now;
+  }
+}
+
+void updateMotorVelocity(int pin, SensorData &s) {
+  // IGNORE STATIONARY OBJECTS
+  // Threshold: Must be moving toward user faster than 0.7 ft/s
+  if (s.velocityFps < 0.7) {
+    analogWrite(pin, 0);
+    return;
+  }
+
+  // DYNAMIC FEEDBACK BASED ON APPROACH SPEED
+  // Tier 1: CRITICAL APPROACH (> 4 ft/s) - Constant High
+  if (s.velocityFps > 4.0) {
+    analogWrite(pin, 255);
+  } 
+  // Tier 2: FAST APPROACH (2 - 4 ft/s) - Rapid Pulse
+  else if (s.velocityFps > 2.0) {
+    int state = (millis() % 200 < 100) ? 200 : 0;
+    analogWrite(pin, state);
+  }
+  // Tier 3: SLOW APPROACH (0.7 - 2 ft/s) - Slow Pulse
+  else {
+    int state = (millis() % 800 < 200) ? 120 : 0;
+    analogWrite(pin, state);
+  }
+}
+
+void readTFmini(HardwareSerial &s, int &dist) {
+  while (s.available() >= 9) {
+    if (s.read() == 0x59) {
+      if (s.read() == 0x59) {
+        uint8_t low = s.read();
+        uint8_t high = s.read();
+        int tempDist = low + (high << 8);
+        if (tempDist > 0 && tempDist < 1200) dist = tempDist; 
+        for (int i = 0; i < 5; i++) s.read(); 
+      }
+    }
+  }
+}
