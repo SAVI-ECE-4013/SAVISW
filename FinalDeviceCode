@@ -1,127 +1,155 @@
+// Import all necessary libraries
 #include <Wire.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BNO055.h>
 
-// --- Configuration ---
+// Set up pins for each motor
 const int MOTOR_LEFT = 2;
 const int MOTOR_RIGHT = 3;
 
-// Structure to track sensor state for velocity calculations
+// Custom structure to track sensor state to help with calculating velocity
 struct SensorData {
+  // Current obstacle distance
   int currentDistCm = 0;
+  // Last obstacle distance
   int lastDistCm = 0;
+  // Obstacle's velocity in feet per second
   float velocityFps = 0.0;
+  // Last time the sensor data was taken (used for latency measurements)
   unsigned long lastTimestamp = 0;
-  bool objectInView = false; // Tracks if an object was seen in the last frame
+  // Determines if object was in the last frame or not
+  bool objectInView = false;
 };
 
+// Set up two LiDAR sensors
 SensorData leftSensor, rightSensor;
+// Set up IMU
 Adafruit_BNO055 bno = Adafruit_BNO055(55);
 
-// Latency Variables
+// Create variables for latency
 unsigned long totalLatency = 0;
 int latencyCount = 0;
 
+// Setup function
 void setup() {
+  // Begin serial for debugging purposes in Arduino IDE
   Serial.begin(115200); 
-  Serial1.begin(115200); // TFmini Left
-  Serial2.begin(115200); // TFmini Right
+  // Begin LiDAR UART for left side
+  Serial1.begin(115200);
+  // Begin LiDAR UART for right side
+  Serial2.begin(115200);
 
+  // Set up motor pins using the previously set GPIOs
   pinMode(MOTOR_LEFT, OUTPUT);
   pinMode(MOTOR_RIGHT, OUTPUT);
 
+  // Check if the IMU is working
   if (!bno.begin()) {
     Serial.println("IMU Error: BNO055 not detected!");
     while (1);
   }
   bno.setExtCrystalUse(true);
-
-  Serial.println("--- SAVI Dynamic Velocity Test ---");
 }
 
+// Main loop
 void loop() {
+  // Save start time for the loop
   unsigned long loopStart = micros();
 
-  // 1. Capture Current Distances
+  // Capture distance on both LiDARs
   readTFmini(Serial1, leftSensor.currentDistCm);
   readTFmini(Serial2, rightSensor.currentDistCm);
   
-  // 2. Calculate Approach Velocities
+  // Calculate obstacle velocities for both LiDARS
   calculateVelocity(leftSensor);
   calculateVelocity(rightSensor);
 
+  // Create an event for the IMU
   sensors_event_t event;
   bno.getEvent(&event);
 
-  // 3. Haptic Logic (Now Velocity-Driven)
+  // Drive the motors corresponding to the obstacle velocity
   updateMotorVelocity(MOTOR_LEFT, leftSensor);
   updateMotorVelocity(MOTOR_RIGHT, rightSensor);
 
-  // 4. Latency Tracking
+  // Determine the latency of the loop
   unsigned long loopEnd = micros();
   totalLatency += (loopEnd - loopStart);
   latencyCount++;
 
-  // 5. Data Printout (Every 500ms)
+  // Print out all necessary information for tests
   static unsigned long lastPrint = 0;
   if (millis() - lastPrint > 500) {
+    // Calculate average latency
     float avgLat = (float)totalLatency / latencyCount;
+    // Print left and right velocities
     Serial.print("L_Vel: "); Serial.print(leftSensor.velocityFps, 2); Serial.print(" fps | ");
     Serial.print("R_Vel: "); Serial.print(rightSensor.velocityFps, 2); Serial.print(" fps | ");
+    // Print average latency
     Serial.print("Avg Latency: "); Serial.print(avgLat, 1); Serial.println(" us");
-    
+
+    // Reset variables before next loop
     totalLatency = 0;
     latencyCount = 0;
     lastPrint = millis();
   }
 }
 
-// --- Helper Functions ---
+// Helper functions
 
+// Calculates the velocity using formula we discussed in our presentation
 void calculateVelocity(SensorData &s) {
+  // Gets current time
   unsigned long now = millis();
-  float deltaTime = (now - s.lastTimestamp) / 1000.0; // Seconds
+  // Calculate the change in time ((Current time - Last Time) converted to seconds)
+  float deltaTime = (now - s.lastTimestamp) / 1000.0;
 
-  if (deltaTime >= 0.05) { // Only update velocity every 50ms for stability
-    // Change in feet / change in time
-    // Positive = Getting Closer, Negative = Moving Away
+  // Create a delay so that velocity is updated every 50ms
+  if (deltaTime >= 0.05) { 
+    // Calculate the change in distance and convert to ft
     float distChangeFt = (s.lastDistCm - s.currentDistCm) / 30.48;
+    // Change in feet / change in time (Only set off with positive velocities as that is approaching)
     s.velocityFps = distChangeFt / deltaTime;
 
+    // Set new last distance measurement
     s.lastDistCm = s.currentDistCm;
+    // Set new last time measurement
     s.lastTimestamp = now;
   }
 }
 
+// Updates motor velocity based on the detected LiDAR velocity
 void updateMotorVelocity(int pin, SensorData &s) {
-  // IGNORE STATIONARY OBJECTS
-  // Threshold: Must be moving toward user faster than 0.7 ft/s
+  // Set threshold that velocities < 0.7 feet per second are ignored
   if (s.velocityFps < 0.7) {
     analogWrite(pin, 0);
     return;
   }
 
-  // DYNAMIC FEEDBACK BASED ON APPROACH SPEED
-  // Tier 1: CRITICAL APPROACH (> 4 ft/s) - Constant High
+  // Tier 1: Critical Alert (> 4 ft/s) - Constant High PWM
   if (s.velocityFps > 4.0) {
     analogWrite(pin, 255);
   } 
-  // Tier 2: FAST APPROACH (2 - 4 ft/s) - Rapid Pulse
+  // Tier 2: Fast Alert (2 - 4 ft/s) - Rapid Pulse
   else if (s.velocityFps > 2.0) {
     int state = (millis() % 200 < 100) ? 200 : 0;
     analogWrite(pin, state);
   }
-  // Tier 3: SLOW APPROACH (0.7 - 2 ft/s) - Slow Pulse
+  // Tier 3: Slow Alert (0.7 - 2 ft/s) - Slow Pulse
   else {
     int state = (millis() % 800 < 200) ? 120 : 0;
     analogWrite(pin, state);
   }
 }
 
+// Polls the sensor for serial data
 void readTFmini(HardwareSerial &s, int &dist) {
+  // Loop while data is available
   while (s.available() >= 9) {
+    // Check correct header values
     if (s.read() == 0x59) {
       if (s.read() == 0x59) {
+        // Process data provided by the LiDAR
         uint8_t low = s.read();
         uint8_t high = s.read();
         int tempDist = low + (high << 8);
